@@ -10,7 +10,6 @@
 
 #include "ae.h"
 #include "zmalloc.h"
-#include "config.h"
 #include "ae_epoll.c"
 
 aeEventLoop *aeCreateEventLoop(int setsize) {
