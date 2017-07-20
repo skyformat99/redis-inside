@@ -1,3 +1,33 @@
+/* anet.c -- Basic TCP socket stuff made a bit less boring
+ *
+ * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "fmacros.h"
 
 #include <sys/types.h>
@@ -71,6 +101,8 @@ int anetKeepAlive(char *err, int fd, int interval)
         anetSetError(err, "setsockopt SO_KEEPALIVE: %s", strerror(errno));
         return ANET_ERR;
     }
+
+#ifdef __linux__
     /* Default settings are more or less garbage, with the keepalive time
      * set to 7200 by default on Linux. Modify settings to make the feature
      * actually useful. */
@@ -99,6 +131,9 @@ int anetKeepAlive(char *err, int fd, int interval)
         anetSetError(err, "setsockopt TCP_KEEPCNT: %s\n", strerror(errno));
         return ANET_ERR;
     }
+#else
+    ((void) interval); /* Avoid unused var warning for non Linux systems. */
+#endif
 
     return ANET_OK;
 }
@@ -345,10 +380,8 @@ int anetUnixGenericConnect(char *err, char *path, int flags)
     sa.sun_family = AF_LOCAL;
     strncpy(sa.sun_path,path,sizeof(sa.sun_path)-1);
     if (flags & ANET_CONNECT_NONBLOCK) {
-        if (anetNonBlock(err,s) != ANET_OK) {
-            close(s);
+        if (anetNonBlock(err,s) != ANET_OK)
             return ANET_ERR;
-        }
     }
     if (connect(s,(struct sockaddr*)&sa,sizeof(sa)) == -1) {
         if (errno == EINPROGRESS &&
@@ -376,7 +409,7 @@ int anetUnixNonBlockConnect(char *err, char *path)
  * (unless error or EOF condition is encountered) */
 int anetRead(int fd, char *buf, int count)
 {
-    ssize_t nread, totlen = 0;
+    int nread, totlen = 0;
     while(totlen != count) {
         nread = read(fd,buf,count-totlen);
         if (nread == 0) return totlen;
@@ -387,11 +420,11 @@ int anetRead(int fd, char *buf, int count)
     return totlen;
 }
 
-/* Like write(2) but make sure 'count' is written before to return
+/* Like write(2) but make sure 'count' is read before to return
  * (unless error is encountered) */
 int anetWrite(int fd, char *buf, int count)
 {
-    ssize_t nwritten, totlen = 0;
+    int nwritten, totlen = 0;
     while(totlen != count) {
         nwritten = write(fd,buf,count-totlen);
         if (nwritten == 0) return totlen;
@@ -429,7 +462,7 @@ static int anetV6Only(char *err, int s) {
 
 static int _anetTcpServer(char *err, int port, char *bindaddr, int af, int backlog)
 {
-    int s = -1, rv;
+    int s, rv;
     char _port[6];  /* strlen("65535") */
     struct addrinfo hints, *servinfo, *p;
 
@@ -453,12 +486,11 @@ static int _anetTcpServer(char *err, int port, char *bindaddr, int af, int backl
         goto end;
     }
     if (p == NULL) {
-        anetSetError(err, "unable to bind socket, errno: %d", errno);
+        anetSetError(err, "unable to bind socket");
         goto error;
     }
 
 error:
-    if (s != -1) close(s);
     s = ANET_ERR;
 end:
     freeaddrinfo(servinfo);
@@ -575,23 +607,6 @@ error:
     return -1;
 }
 
-/* Format an IP,port pair into something easy to parse. If IP is IPv6
- * (matches for ":"), the ip is surrounded by []. IP and port are just
- * separated by colons. This the standard to display addresses within Redis. */
-int anetFormatAddr(char *buf, size_t buf_len, char *ip, int port) {
-    return snprintf(buf,buf_len, strchr(ip,':') ?
-           "[%s]:%d" : "%s:%d", ip, port);
-}
-
-/* Like anetFormatAddr() but extract ip and port from the socket's peer. */
-int anetFormatPeer(int fd, char *buf, size_t buf_len) {
-    char ip[INET6_ADDRSTRLEN];
-    int port;
-
-    anetPeerToString(fd,ip,sizeof(ip),&port);
-    return anetFormatAddr(buf, buf_len, ip, port);
-}
-
 int anetSockName(int fd, char *ip, size_t ip_len, int *port) {
     struct sockaddr_storage sa;
     socklen_t salen = sizeof(sa);
@@ -612,12 +627,4 @@ int anetSockName(int fd, char *ip, size_t ip_len, int *port) {
         if (port) *port = ntohs(s->sin6_port);
     }
     return 0;
-}
-
-int anetFormatSock(int fd, char *fmt, size_t fmt_len) {
-    char ip[INET6_ADDRSTRLEN];
-    int port;
-
-    anetSockName(fd,ip,sizeof(ip),&port);
-    return anetFormatAddr(fmt, fmt_len, ip, port);
 }

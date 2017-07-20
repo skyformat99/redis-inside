@@ -1,5 +1,5 @@
-#ifndef ZMALLOC_H
-#define ZMALLOC_H
+#ifndef _ZMALLOC_H
+#define _ZMALLOC_H
 
 #ifndef zmalloc
 #define zmalloc malloc
@@ -13,4 +13,4 @@
 #define zrealloc realloc
 #endif
 
-#endif /* ZMALLOC_H */
+#endif /* _ZMALLOC_H */

@@ -1,3 +1,35 @@
+/* A simple event-driven programming library. Originally I wrote this code
+ * for the Jim's event-loop (Jim is a Tcl interpreter) but later translated
+ * it in form of a library for easy reuse.
+ *
+ * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include <stdio.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -10,7 +42,23 @@
 
 #include "ae.h"
 #include "zmalloc.h"
-#include "ae_epoll.c"
+#include "config.h"
+
+/* Include the best multiplexing layer supported by this system.
+ * The following should be ordered by performances, descending. */
+#ifdef HAVE_EVPORT
+#include "ae_evport.c"
+#else
+    #ifdef HAVE_EPOLL
+    #include "ae_epoll.c"
+    #else
+        #ifdef HAVE_KQUEUE
+        #include "ae_kqueue.c"
+        #else
+        #include "ae_select.c"
+        #endif
+    #endif
+#endif
 
 aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
@@ -27,7 +75,6 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->stop = 0;
     eventLoop->maxfd = -1;
     eventLoop->beforesleep = NULL;
-    eventLoop->aftersleep = NULL;
     if (aeApiCreate(eventLoop) == -1) goto err;
     /* Events with mask == AE_NONE are not set. So let's initialize the
      * vector with it. */
@@ -174,12 +221,21 @@ long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
 
 int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
 {
-    aeTimeEvent *te = eventLoop->timeEventHead;
+    aeTimeEvent *te, *prev = NULL;
+
+    te = eventLoop->timeEventHead;
     while(te) {
         if (te->id == id) {
-            te->id = AE_DELETED_EVENT_ID;
+            if (prev == NULL)
+                eventLoop->timeEventHead = te->next;
+            else
+                prev->next = te->next;
+            if (te->finalizerProc)
+                te->finalizerProc(eventLoop, te->clientData);
+            zfree(te);
             return AE_OK;
         }
+        prev = te;
         te = te->next;
     }
     return AE_ERR; /* NO event with the specified ID found */
@@ -214,7 +270,7 @@ static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop)
 /* Process time events */
 static int processTimeEvents(aeEventLoop *eventLoop) {
     int processed = 0;
-    aeTimeEvent *te, *prev;
+    aeTimeEvent *te;
     long long maxId;
     time_t now = time(NULL);
 
@@ -235,32 +291,12 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
     }
     eventLoop->lastTime = now;
 
-    prev = NULL;
     te = eventLoop->timeEventHead;
     maxId = eventLoop->timeEventNextId-1;
     while(te) {
         long now_sec, now_ms;
         long long id;
 
-        /* Remove events scheduled for deletion. */
-        if (te->id == AE_DELETED_EVENT_ID) {
-            aeTimeEvent *next = te->next;
-            if (prev == NULL)
-                eventLoop->timeEventHead = te->next;
-            else
-                prev->next = te->next;
-            if (te->finalizerProc)
-                te->finalizerProc(eventLoop, te->clientData);
-            zfree(te);
-            te = next;
-            continue;
-        }
-
-        /* Make sure we don't process time events created by time events in
-         * this iteration. Note that this check is currently useless: we always
-         * add new timers on the head, however if we change the implementation
-         * detail, this check may be useful again: we keep it here for future
-         * defense. */
         if (te->id > maxId) {
             te = te->next;
             continue;
@@ -274,14 +310,28 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
             id = te->id;
             retval = te->timeProc(eventLoop, id, te->clientData);
             processed++;
+            /* After an event is processed our time event list may
+             * no longer be the same, so we restart from head.
+             * Still we make sure to don't process events registered
+             * by event handlers itself in order to don't loop forever.
+             * To do so we saved the max ID we want to handle.
+             *
+             * FUTURE OPTIMIZATIONS:
+             * Note that this is NOT great algorithmically. Redis uses
+             * a single time event so it's not a problem but the right
+             * way to do this is to add the new elements on head, and
+             * to flag deleted elements in a special way for later
+             * deletion (putting references to the nodes to delete into
+             * another linked list). */
             if (retval != AE_NOMORE) {
                 aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
             } else {
-                te->id = AE_DELETED_EVENT_ID;
+                aeDeleteTimeEvent(eventLoop, id);
             }
+            te = eventLoop->timeEventHead;
+        } else {
+            te = te->next;
         }
-        prev = te;
-        te = te->next;
     }
     return processed;
 }
@@ -321,22 +371,19 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
         if (shortest) {
             long now_sec, now_ms;
 
+            /* Calculate the time missing for the nearest
+             * timer to fire. */
             aeGetTime(&now_sec, &now_ms);
             tvp = &tv;
-
-            /* How many milliseconds we need to wait for the next
-             * time event to fire? */
-            long long ms =
-                (shortest->when_sec - now_sec)*1000 +
-                shortest->when_ms - now_ms;
-
-            if (ms > 0) {
-                tvp->tv_sec = ms/1000;
-                tvp->tv_usec = (ms % 1000)*1000;
+            tvp->tv_sec = shortest->when_sec - now_sec;
+            if (shortest->when_ms < now_ms) {
+                tvp->tv_usec = ((shortest->when_ms+1000) - now_ms)*1000;
+                tvp->tv_sec --;
             } else {
-                tvp->tv_sec = 0;
-                tvp->tv_usec = 0;
+                tvp->tv_usec = (shortest->when_ms - now_ms)*1000;
             }
+            if (tvp->tv_sec < 0) tvp->tv_sec = 0;
+            if (tvp->tv_usec < 0) tvp->tv_usec = 0;
         } else {
             /* If we have to check for events but need to return
              * ASAP because of AE_DONT_WAIT we need to set the timeout
@@ -350,21 +397,14 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             }
         }
 
-        /* Call the multiplexing API, will return only on timeout or when
-         * some event fires. */
         numevents = aeApiPoll(eventLoop, tvp);
-
-        /* After sleep callback. */
-        if (eventLoop->aftersleep != NULL)
-            eventLoop->aftersleep(eventLoop);
-
         for (j = 0; j < numevents; j++) {
             aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
             int mask = eventLoop->fired[j].mask;
             int fd = eventLoop->fired[j].fd;
             int rfired = 0;
 
-	    /* note the fe->mask & mask & ... code: maybe an already processed
+            /* note the fe->mask & mask & ... code: maybe an already processed
              * event removed an element that fired and we still didn't
              * processed, so we check if the event is still valid. */
             if (fe->mask & mask & AE_READABLE) {
@@ -422,8 +462,4 @@ char *aeGetApiName(void) {
 
 void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep) {
     eventLoop->beforesleep = beforesleep;
-}
-
-void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *aftersleep) {
-    eventLoop->aftersleep = aftersleep;
 }
