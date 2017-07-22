@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <time.h>
 
-#include "../src/ae.h"
+#include "ae.h"
 
 int print(struct aeEventLoop *loop, long long id, void *clientData)
 {
